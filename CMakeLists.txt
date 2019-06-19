@@ -254,19 +254,20 @@ set(project_headers
 
 ## Find and include needed header folders and libraries
 if (HB_HAVE_FREETYPE)
+    include(FindAnyProject)
+    find_anyproject(Freetype DEFAULT ON)
+  # include(FindFreetype)
+  # if (NOT FREETYPE_FOUND)
+  #   message(FATAL_ERROR "HB_HAVE_FREETYPE was set, but we failed to find it. Maybe add a CMAKE_PREFIX_PATH= to your Freetype2 install prefix")
+  # endif()
+    if(FREETYPE_FOUND)
+      list(APPEND THIRD_PARTY_LIBS ${FREETYPE_LIBRARIES})
+      include_directories(AFTER ${FREETYPE_INCLUDE_DIRS})
+      add_definitions(-DHAVE_FREETYPE=1 -DHAVE_FT_FACE_GETCHARVARIANTINDEX=1)
 
-  include(FindFreetype)
-  if (NOT FREETYPE_FOUND)
-    message(FATAL_ERROR "HB_HAVE_FREETYPE was set, but we failed to find it. Maybe add a CMAKE_PREFIX_PATH= to your Freetype2 install prefix")
-  endif()
-
-  list(APPEND THIRD_PARTY_LIBS ${FREETYPE_LIBRARIES})
-  include_directories(AFTER ${FREETYPE_INCLUDE_DIRS})
-  add_definitions(-DHAVE_FREETYPE=1 -DHAVE_FT_FACE_GETCHARVARIANTINDEX=1)
-
-  list(APPEND project_sources ${PROJECT_SOURCE_DIR}/src/hb-ft.cc)
-  list(APPEND project_headers ${PROJECT_SOURCE_DIR}/src/hb-ft.h)
-
+      list(APPEND project_sources ${PROJECT_SOURCE_DIR}/src/hb-ft.cc)
+      list(APPEND project_headers ${PROJECT_SOURCE_DIR}/src/hb-ft.h)
+    endif()
 endif ()
 
 if (HB_HAVE_GRAPHITE2)
