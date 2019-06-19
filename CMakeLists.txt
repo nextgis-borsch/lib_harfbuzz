@@ -262,7 +262,7 @@ if (HB_HAVE_FREETYPE)
   # endif()
     if(FREETYPE_FOUND)
       list(APPEND THIRD_PARTY_LIBS ${FREETYPE_LIBRARIES})
-      include_directories(AFTER ${FREETYPE_INCLUDE_DIRS})
+      include_directories(AFTER ${FREETYPE_INCLUDE_DIRS} ${FREETYPE_INCLUDE_DIRS}/freetype2)
       add_definitions(-DHAVE_FREETYPE=1 -DHAVE_FT_FACE_GETCHARVARIANTINDEX=1)
 
       list(APPEND project_sources ${PROJECT_SOURCE_DIR}/src/hb-ft.cc)
