@@ -507,7 +507,12 @@ endif ()
 set(INSTALL_TARGETS harfbuzz)
 
 ## Define harfbuzz library
-add_library(harfbuzz ${project_sources} ${project_extra_sources} ${project_headers})
+if(OSX_FRAMEWORK)
+    add_library(harfbuzz SHARED ${project_sources} ${project_extra_sources} ${project_headers})
+else()
+    add_library(harfbuzz ${project_sources} ${project_extra_sources} ${project_headers})
+endif()
+
 target_link_libraries(harfbuzz ${THIRD_PARTY_LIBS})
 
 ## Define harfbuzz-gobject library
@@ -659,6 +664,7 @@ if (BUILD_FRAMEWORK)
     MACOSX_FRAMEWORK_IDENTIFIER "harfbuzz"
     XCODE_ATTRIBUTE_INSTALL_PATH "@rpath"
     VERSION ${VERSION}
+    SOVERSION ${FRAMEWORK_VERSION}
   )
 endif ()
 
