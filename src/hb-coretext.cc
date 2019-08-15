@@ -26,22 +26,31 @@
  * Google Author(s): Behdad Esfahbod
  */
 
-#define HB_SHAPER coretext
-#include "hb-shaper-impl-private.hh"
+#include "hb.hh"
+
+#ifdef HAVE_CORETEXT
+
+#include "hb-shaper-impl.hh"
 
 #include "hb-coretext.h"
+#include "hb-aat-layout.hh"
 #include <math.h>
 
 
-#ifndef HB_DEBUG_CORETEXT
-#define HB_DEBUG_CORETEXT (HB_DEBUG+0)
-#endif
+/**
+ * SECTION:hb-coretext
+ * @title: hb-coretext
+ * @short_description: CoreText integration
+ * @include: hb-coretext.h
+ *
+ * Functions for using HarfBuzz with the CoreText fonts.
+ **/
 
 /* https://developer.apple.com/documentation/coretext/1508745-ctfontcreatewithgraphicsfont */
 #define HB_CORETEXT_DEFAULT_FONT_SIZE 12.f
 
 static CGFloat
-coretext_font_size (float ptem)
+coretext_font_size_from_ptem (float ptem)
 {
   /* CoreText points are CSS pixels (96 per inch),
    * NOT typographic points (72 per inch).
@@ -49,7 +58,13 @@ coretext_font_size (float ptem)
    * https://developer.apple.com/library/content/documentation/GraphicsAnimation/Conceptual/HighResolutionOSX/Explained/Explained.html
    */
   ptem *= 96.f / 72.f;
-  return ptem <= 0.f ? HB_CORETEXT_DEFAULT_FONT_SIZE : ptem;
+  return (CGFloat) (ptem <= 0.f ? HB_CORETEXT_DEFAULT_FONT_SIZE : ptem);
+}
+static float
+coretext_font_size_to_ptem (CGFloat size)
+{
+  size *= 72. / 96.;
+  return size <= 0 ? 0 : size;
 }
 
 static void
@@ -60,7 +75,7 @@ release_table_data (void *user_data)
 }
 
 static hb_blob_t *
-reference_table  (hb_face_t *face HB_UNUSED, hb_tag_t tag, void *user_data)
+_hb_cg_reference_table (hb_face_t *face HB_UNUSED, hb_tag_t tag, void *user_data)
 {
   CGFontRef cg_font = reinterpret_cast<CGFontRef> (user_data);
   CFDataRef cf_data = CGFontCopyTableForTag (cg_font, tag);
@@ -70,7 +85,10 @@ reference_table  (hb_face_t *face HB_UNUSED, hb_tag_t tag, void *user_data)
   const char *data = reinterpret_cast<const char*> (CFDataGetBytePtr (cf_data));
   const size_t length = CFDataGetLength (cf_data);
   if (!data || !length)
+  {
+    CFRelease (cf_data);
     return nullptr;
+  }
 
   return hb_blob_create (data, length, HB_MEMORY_MODE_READONLY,
 			 reinterpret_cast<void *> (const_cast<__CFData *> (cf_data)),
@@ -83,23 +101,9 @@ _hb_cg_font_release (void *data)
   CGFontRelease ((CGFontRef) data);
 }
 
-hb_face_t *
-hb_coretext_face_create (CGFontRef cg_font)
-{
-  return hb_face_create_for_tables (reference_table, CGFontRetain (cg_font), _hb_cg_font_release);
-}
-
-HB_SHAPER_DATA_ENSURE_DEFINE(coretext, face)
-HB_SHAPER_DATA_ENSURE_DEFINE_WITH_CONDITION(coretext, font,
-	fabs (CTFontGetSize((CTFontRef) data) - coretext_font_size (font->ptem)) <= .5
-)
-
-/*
- * shaper face data
- */
 
 static CTFontDescriptorRef
-get_last_resort_font_desc (void)
+get_last_resort_font_desc ()
 {
   // TODO Handle allocation failures?
   CTFontDescriptorRef last_resort = CTFontDescriptorCreateWithNameAndSize (CFSTR("LastResort"), 0);
@@ -170,6 +174,10 @@ create_ct_font (CGFontRef cg_font, CGFloat font_size)
   if (CFStringHasPrefix (cg_postscript_name, CFSTR (".SFNSText")) ||
       CFStringHasPrefix (cg_postscript_name, CFSTR (".SFNSDisplay")))
   {
+#if !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && MAC_OS_X_VERSION_MIN_REQUIRED < 1080
+# define kCTFontUIFontSystem kCTFontSystemFontType
+# define kCTFontUIFontEmphasizedSystem kCTFontEmphasizedSystemFontType
+#endif
     CTFontUIFontType font_type = kCTFontUIFontSystem;
     if (CFStringHasSuffix (cg_postscript_name, CFSTR ("-Bold")))
       font_type = kCTFontUIFontEmphasizedSystem;
@@ -208,7 +216,18 @@ create_ct_font (CGFontRef cg_font, CGFloat font_size)
       return ct_font;
   }
 
-  CFURLRef original_url = (CFURLRef)CTFontCopyAttribute(ct_font, kCTFontURLAttribute);
+  CFURLRef original_url = nullptr;
+#if !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && MAC_OS_X_VERSION_MIN_REQUIRED < 1060
+  ATSFontRef atsFont;
+  FSRef fsref;
+  OSStatus status;
+  atsFont = CTFontGetPlatformFont (ct_font, NULL);
+  status = ATSFontGetFileReference (atsFont, &fsref);
+  if (status == noErr)
+    original_url = CFURLCreateFromFSRef (NULL, &fsref);
+#else
+  original_url = (CFURLRef) CTFontCopyAttribute (ct_font, kCTFontURLAttribute);
+#endif
 
   /* Create font copy with cascade list that has LastResort first; this speeds up CoreText
    * font fallback which we don't need anyway. */
@@ -227,7 +246,15 @@ create_ct_font (CGFontRef cg_font, CGFloat font_size)
        * system locations that we cannot access from the sandboxed renderer
        * process in Blink. This can be detected by the new file URL location
        * that the newly found font points to. */
-      CFURLRef new_url = (CFURLRef) CTFontCopyAttribute (new_ct_font, kCTFontURLAttribute);
+      CFURLRef new_url = nullptr;
+#if !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && MAC_OS_X_VERSION_MIN_REQUIRED < 1060
+      atsFont = CTFontGetPlatformFont (new_ct_font, NULL);
+      status = ATSFontGetFileReference (atsFont, &fsref);
+      if (status == noErr)
+        new_url = CFURLCreateFromFSRef (NULL, &fsref);
+#else
+      new_url = (CFURLRef) CTFontCopyAttribute (new_ct_font, kCTFontURLAttribute);
+#endif
       // Keep reconfigured font if URL cannot be retrieved (seems to be the case
       // on Mac OS 10.12 Sierra), speculative fix for crbug.com/625606
       if (!original_url || !new_url || CFEqual (original_url, new_url)) {
@@ -249,7 +276,7 @@ create_ct_font (CGFontRef cg_font, CGFloat font_size)
   return ct_font;
 }
 
-hb_coretext_shaper_face_data_t *
+hb_coretext_face_data_t *
 _hb_coretext_shaper_face_data_create (hb_face_t *face)
 {
   CGFontRef cg_font = create_cg_font (face);
@@ -260,13 +287,19 @@ _hb_coretext_shaper_face_data_create (hb_face_t *face)
     return nullptr;
   }
 
-  return (hb_coretext_shaper_face_data_t *) cg_font;
+  return (hb_coretext_face_data_t *) cg_font;
 }
 
 void
-_hb_coretext_shaper_face_data_destroy (hb_coretext_shaper_face_data_t *data)
+_hb_coretext_shaper_face_data_destroy (hb_coretext_face_data_t *data)
 {
   CFRelease ((CGFontRef) data);
+}
+
+hb_face_t *
+hb_coretext_face_create (CGFontRef cg_font)
+{
+  return hb_face_create_for_tables (_hb_cg_reference_table, CGFontRetain (cg_font), _hb_cg_font_release);
 }
 
 /*
@@ -275,23 +308,19 @@ _hb_coretext_shaper_face_data_destroy (hb_coretext_shaper_face_data_t *data)
 CGFontRef
 hb_coretext_face_get_cg_font (hb_face_t *face)
 {
-  if (unlikely (!hb_coretext_shaper_face_data_ensure (face))) return nullptr;
-  return (CGFontRef) HB_SHAPER_DATA_GET (face);
+  return (CGFontRef) (const void *) face->data.coretext;
 }
 
 
-/*
- * shaper font data
- */
-
-hb_coretext_shaper_font_data_t *
+hb_coretext_font_data_t *
 _hb_coretext_shaper_font_data_create (hb_font_t *font)
 {
   hb_face_t *face = font->face;
-  if (unlikely (!hb_coretext_shaper_face_data_ensure (face))) return nullptr;
-  CGFontRef cg_font = (CGFontRef) HB_SHAPER_DATA_GET (face);
+  const hb_coretext_face_data_t *face_data = face->data.coretext;
+  if (unlikely (!face_data)) return nullptr;
+  CGFontRef cg_font = (CGFontRef) (const void *) face->data.coretext;
 
-  CTFontRef ct_font = create_ct_font (cg_font, coretext_font_size (font->ptem));
+  CTFontRef ct_font = create_ct_font (cg_font, coretext_font_size_from_ptem (font->ptem));
 
   if (unlikely (!ct_font))
   {
@@ -299,42 +328,75 @@ _hb_coretext_shaper_font_data_create (hb_font_t *font)
     return nullptr;
   }
 
-  return (hb_coretext_shaper_font_data_t *) ct_font;
+  return (hb_coretext_font_data_t *) ct_font;
 }
 
 void
-_hb_coretext_shaper_font_data_destroy (hb_coretext_shaper_font_data_t *data)
+_hb_coretext_shaper_font_data_destroy (hb_coretext_font_data_t *data)
 {
   CFRelease ((CTFontRef) data);
 }
 
-
-/*
- * shaper shape_plan data
- */
-
-struct hb_coretext_shaper_shape_plan_data_t {};
-
-hb_coretext_shaper_shape_plan_data_t *
-_hb_coretext_shaper_shape_plan_data_create (hb_shape_plan_t    *shape_plan HB_UNUSED,
-					     const hb_feature_t *user_features HB_UNUSED,
-					     unsigned int        num_user_features HB_UNUSED,
-					     const int          *coords HB_UNUSED,
-					     unsigned int        num_coords HB_UNUSED)
+static const hb_coretext_font_data_t *
+hb_coretext_font_data_sync (hb_font_t *font)
 {
-  return (hb_coretext_shaper_shape_plan_data_t *) HB_SHAPER_DATA_SUCCEEDED;
+retry:
+  const hb_coretext_font_data_t *data = font->data.coretext;
+  if (unlikely (!data)) return nullptr;
+
+  if (fabs (CTFontGetSize((CTFontRef) data) - coretext_font_size_from_ptem (font->ptem)) > .5)
+  {
+    /* XXX-MT-bug
+     * Note that evaluating condition above can be dangerous if another thread
+     * got here first and destructed data.  That's, as always, bad use pattern.
+     * If you modify the font (change font size), other threads must not be
+     * using it at the same time.  However, since this check is delayed to
+     * when one actually tries to shape something, this is a XXX race condition
+     * (and the only one we have that I know of) right now.  Ie. you modify the
+     * font size in one thread, then (supposedly safely) try to use it from two
+     * or more threads and BOOM!  I'm not sure how to fix this.  We want RCU.
+     */
+
+    /* Drop and recreate. */
+    /* If someone dropped it in the mean time, throw it away and don't touch it.
+     * Otherwise, destruct it. */
+    if (likely (font->data.coretext.cmpexch (const_cast<hb_coretext_font_data_t *> (data), nullptr)))
+      _hb_coretext_shaper_font_data_destroy (const_cast<hb_coretext_font_data_t *> (data));
+    else
+      goto retry;
+  }
+  return font->data.coretext;
 }
 
-void
-_hb_coretext_shaper_shape_plan_data_destroy (hb_coretext_shaper_shape_plan_data_t *data HB_UNUSED)
+
+/*
+ * Since: 1.7.2
+ */
+hb_font_t *
+hb_coretext_font_create (CTFontRef ct_font)
 {
+  CGFontRef cg_font = CTFontCopyGraphicsFont (ct_font, nullptr);
+  hb_face_t *face = hb_coretext_face_create (cg_font);
+  CFRelease (cg_font);
+  hb_font_t *font = hb_font_create (face);
+  hb_face_destroy (face);
+
+  if (unlikely (hb_object_is_immutable (font)))
+    return font;
+
+  hb_font_set_ptem (font, coretext_font_size_to_ptem (CTFontGetSize(ct_font)));
+
+  /* Let there be dragons here... */
+  font->data.coretext.cmpexch (nullptr, (hb_coretext_font_data_t *) CFRetain (ct_font));
+
+  return font;
 }
 
 CTFontRef
 hb_coretext_font_get_ct_font (hb_font_t *font)
 {
-  if (unlikely (!hb_coretext_shaper_font_data_ensure (font))) return nullptr;
-  return (CTFontRef)HB_SHAPER_DATA_GET (font);
+  const hb_coretext_font_data_t *data = hb_coretext_font_data_sync (font);
+  return data ? (CTFontRef) data : nullptr;
 }
 
 
@@ -351,7 +413,9 @@ struct active_feature_t {
   feature_record_t rec;
   unsigned int order;
 
-  static int cmp (const active_feature_t *a, const active_feature_t *b) {
+  HB_INTERNAL static int cmp (const void *pa, const void *pb) {
+    const active_feature_t *a = (const active_feature_t *) pa;
+    const active_feature_t *b = (const active_feature_t *) pb;
     return a->rec.feature < b->rec.feature ? -1 : a->rec.feature > b->rec.feature ? 1 :
 	   a->order < b->order ? -1 : a->order > b->order ? 1 :
 	   a->rec.setting < b->rec.setting ? -1 : a->rec.setting > b->rec.setting ? 1 :
@@ -367,7 +431,9 @@ struct feature_event_t {
   bool start;
   active_feature_t feature;
 
-  static int cmp (const feature_event_t *a, const feature_event_t *b) {
+  HB_INTERNAL static int cmp (const void *pa, const void *pb) {
+    const feature_event_t *a = (const feature_event_t *) pa;
+    const feature_event_t *b = (const feature_event_t *) pb;
     return a->index < b->index ? -1 : a->index > b->index ? 1 :
 	   a->start < b->start ? -1 : a->start > b->start ? 1 :
 	   active_feature_t::cmp (&a->feature, &b->feature);
@@ -381,183 +447,6 @@ struct range_record_t {
 };
 
 
-/* The following enum members are added in OS X 10.8. */
-#define kAltHalfWidthTextSelector		6
-#define kAltProportionalTextSelector		5
-#define kAlternateHorizKanaOffSelector		1
-#define kAlternateHorizKanaOnSelector		0
-#define kAlternateKanaType			34
-#define kAlternateVertKanaOffSelector		3
-#define kAlternateVertKanaOnSelector		2
-#define kCaseSensitiveLayoutOffSelector		1
-#define kCaseSensitiveLayoutOnSelector		0
-#define kCaseSensitiveLayoutType		33
-#define kCaseSensitiveSpacingOffSelector	3
-#define kCaseSensitiveSpacingOnSelector		2
-#define kContextualAlternatesOffSelector	1
-#define kContextualAlternatesOnSelector		0
-#define kContextualAlternatesType		36
-#define kContextualLigaturesOffSelector		19
-#define kContextualLigaturesOnSelector		18
-#define kContextualSwashAlternatesOffSelector	5
-#define kContextualSwashAlternatesOnSelector	4
-#define kDefaultLowerCaseSelector		0
-#define kDefaultUpperCaseSelector		0
-#define kHistoricalLigaturesOffSelector		21
-#define kHistoricalLigaturesOnSelector		20
-#define kHojoCharactersSelector			12
-#define kJIS2004CharactersSelector		11
-#define kLowerCasePetiteCapsSelector		2
-#define kLowerCaseSmallCapsSelector		1
-#define kLowerCaseType				37
-#define kMathematicalGreekOffSelector		11
-#define kMathematicalGreekOnSelector		10
-#define kNLCCharactersSelector			13
-#define kQuarterWidthTextSelector		4
-#define kScientificInferiorsSelector		4
-#define kStylisticAltEightOffSelector		17
-#define kStylisticAltEightOnSelector		16
-#define kStylisticAltEighteenOffSelector	37
-#define kStylisticAltEighteenOnSelector		36
-#define kStylisticAltElevenOffSelector		23
-#define kStylisticAltElevenOnSelector		22
-#define kStylisticAltFifteenOffSelector		31
-#define kStylisticAltFifteenOnSelector		30
-#define kStylisticAltFiveOffSelector		11
-#define kStylisticAltFiveOnSelector		10
-#define kStylisticAltFourOffSelector		9
-#define kStylisticAltFourOnSelector		8
-#define kStylisticAltFourteenOffSelector	29
-#define kStylisticAltFourteenOnSelector		28
-#define kStylisticAltNineOffSelector		19
-#define kStylisticAltNineOnSelector		18
-#define kStylisticAltNineteenOffSelector	39
-#define kStylisticAltNineteenOnSelector		38
-#define kStylisticAltOneOffSelector		3
-#define kStylisticAltOneOnSelector		2
-#define kStylisticAltSevenOffSelector		15
-#define kStylisticAltSevenOnSelector		14
-#define kStylisticAltSeventeenOffSelector	35
-#define kStylisticAltSeventeenOnSelector	34
-#define kStylisticAltSixOffSelector		13
-#define kStylisticAltSixOnSelector		12
-#define kStylisticAltSixteenOffSelector		33
-#define kStylisticAltSixteenOnSelector		32
-#define kStylisticAltTenOffSelector		21
-#define kStylisticAltTenOnSelector		20
-#define kStylisticAltThirteenOffSelector	27
-#define kStylisticAltThirteenOnSelector		26
-#define kStylisticAltThreeOffSelector		7
-#define kStylisticAltThreeOnSelector		6
-#define kStylisticAltTwelveOffSelector		25
-#define kStylisticAltTwelveOnSelector		24
-#define kStylisticAltTwentyOffSelector		41
-#define kStylisticAltTwentyOnSelector		40
-#define kStylisticAltTwoOffSelector		5
-#define kStylisticAltTwoOnSelector		4
-#define kStylisticAlternativesType		35
-#define kSwashAlternatesOffSelector		3
-#define kSwashAlternatesOnSelector		2
-#define kThirdWidthTextSelector			3
-#define kTraditionalNamesCharactersSelector	14
-#define kUpperCasePetiteCapsSelector		2
-#define kUpperCaseSmallCapsSelector		1
-#define kUpperCaseType				38
-
-/* Table data courtesy of Apple. */
-static const struct feature_mapping_t {
-    FourCharCode otFeatureTag;
-    uint16_t aatFeatureType;
-    uint16_t selectorToEnable;
-    uint16_t selectorToDisable;
-} feature_mappings[] = {
-    { 'c2pc',   kUpperCaseType,             kUpperCasePetiteCapsSelector,           kDefaultUpperCaseSelector },
-    { 'c2sc',   kUpperCaseType,             kUpperCaseSmallCapsSelector,            kDefaultUpperCaseSelector },
-    { 'calt',   kContextualAlternatesType,  kContextualAlternatesOnSelector,        kContextualAlternatesOffSelector },
-    { 'case',   kCaseSensitiveLayoutType,   kCaseSensitiveLayoutOnSelector,         kCaseSensitiveLayoutOffSelector },
-    { 'clig',   kLigaturesType,             kContextualLigaturesOnSelector,         kContextualLigaturesOffSelector },
-    { 'cpsp',   kCaseSensitiveLayoutType,   kCaseSensitiveSpacingOnSelector,        kCaseSensitiveSpacingOffSelector },
-    { 'cswh',   kContextualAlternatesType,  kContextualSwashAlternatesOnSelector,   kContextualSwashAlternatesOffSelector },
-    { 'dlig',   kLigaturesType,             kRareLigaturesOnSelector,               kRareLigaturesOffSelector },
-    { 'expt',   kCharacterShapeType,        kExpertCharactersSelector,              16 },
-    { 'frac',   kFractionsType,             kDiagonalFractionsSelector,             kNoFractionsSelector },
-    { 'fwid',   kTextSpacingType,           kMonospacedTextSelector,                7 },
-    { 'halt',   kTextSpacingType,           kAltHalfWidthTextSelector,              7 },
-    { 'hist',   kLigaturesType,             kHistoricalLigaturesOnSelector,         kHistoricalLigaturesOffSelector },
-    { 'hkna',   kAlternateKanaType,         kAlternateHorizKanaOnSelector,          kAlternateHorizKanaOffSelector, },
-    { 'hlig',   kLigaturesType,             kHistoricalLigaturesOnSelector,         kHistoricalLigaturesOffSelector },
-    { 'hngl',   kTransliterationType,       kHanjaToHangulSelector,                 kNoTransliterationSelector },
-    { 'hojo',   kCharacterShapeType,        kHojoCharactersSelector,                16 },
-    { 'hwid',   kTextSpacingType,           kHalfWidthTextSelector,                 7 },
-    { 'ital',   kItalicCJKRomanType,        kCJKItalicRomanOnSelector,              kCJKItalicRomanOffSelector },
-    { 'jp04',   kCharacterShapeType,        kJIS2004CharactersSelector,             16 },
-    { 'jp78',   kCharacterShapeType,        kJIS1978CharactersSelector,             16 },
-    { 'jp83',   kCharacterShapeType,        kJIS1983CharactersSelector,             16 },
-    { 'jp90',   kCharacterShapeType,        kJIS1990CharactersSelector,             16 },
-    { 'liga',   kLigaturesType,             kCommonLigaturesOnSelector,             kCommonLigaturesOffSelector },
-    { 'lnum',   kNumberCaseType,            kUpperCaseNumbersSelector,              2 },
-    { 'mgrk',   kMathematicalExtrasType,    kMathematicalGreekOnSelector,           kMathematicalGreekOffSelector },
-    { 'nlck',   kCharacterShapeType,        kNLCCharactersSelector,                 16 },
-    { 'onum',   kNumberCaseType,            kLowerCaseNumbersSelector,              2 },
-    { 'ordn',   kVerticalPositionType,      kOrdinalsSelector,                      kNormalPositionSelector },
-    { 'palt',   kTextSpacingType,           kAltProportionalTextSelector,           7 },
-    { 'pcap',   kLowerCaseType,             kLowerCasePetiteCapsSelector,           kDefaultLowerCaseSelector },
-    { 'pkna',   kTextSpacingType,           kProportionalTextSelector,              7 },
-    { 'pnum',   kNumberSpacingType,         kProportionalNumbersSelector,           4 },
-    { 'pwid',   kTextSpacingType,           kProportionalTextSelector,              7 },
-    { 'qwid',   kTextSpacingType,           kQuarterWidthTextSelector,              7 },
-    { 'ruby',   kRubyKanaType,              kRubyKanaOnSelector,                    kRubyKanaOffSelector },
-    { 'sinf',   kVerticalPositionType,      kScientificInferiorsSelector,           kNormalPositionSelector },
-    { 'smcp',   kLowerCaseType,             kLowerCaseSmallCapsSelector,            kDefaultLowerCaseSelector },
-    { 'smpl',   kCharacterShapeType,        kSimplifiedCharactersSelector,          16 },
-    { 'ss01',   kStylisticAlternativesType, kStylisticAltOneOnSelector,             kStylisticAltOneOffSelector },
-    { 'ss02',   kStylisticAlternativesType, kStylisticAltTwoOnSelector,             kStylisticAltTwoOffSelector },
-    { 'ss03',   kStylisticAlternativesType, kStylisticAltThreeOnSelector,           kStylisticAltThreeOffSelector },
-    { 'ss04',   kStylisticAlternativesType, kStylisticAltFourOnSelector,            kStylisticAltFourOffSelector },
-    { 'ss05',   kStylisticAlternativesType, kStylisticAltFiveOnSelector,            kStylisticAltFiveOffSelector },
-    { 'ss06',   kStylisticAlternativesType, kStylisticAltSixOnSelector,             kStylisticAltSixOffSelector },
-    { 'ss07',   kStylisticAlternativesType, kStylisticAltSevenOnSelector,           kStylisticAltSevenOffSelector },
-    { 'ss08',   kStylisticAlternativesType, kStylisticAltEightOnSelector,           kStylisticAltEightOffSelector },
-    { 'ss09',   kStylisticAlternativesType, kStylisticAltNineOnSelector,            kStylisticAltNineOffSelector },
-    { 'ss10',   kStylisticAlternativesType, kStylisticAltTenOnSelector,             kStylisticAltTenOffSelector },
-    { 'ss11',   kStylisticAlternativesType, kStylisticAltElevenOnSelector,          kStylisticAltElevenOffSelector },
-    { 'ss12',   kStylisticAlternativesType, kStylisticAltTwelveOnSelector,          kStylisticAltTwelveOffSelector },
-    { 'ss13',   kStylisticAlternativesType, kStylisticAltThirteenOnSelector,        kStylisticAltThirteenOffSelector },
-    { 'ss14',   kStylisticAlternativesType, kStylisticAltFourteenOnSelector,        kStylisticAltFourteenOffSelector },
-    { 'ss15',   kStylisticAlternativesType, kStylisticAltFifteenOnSelector,         kStylisticAltFifteenOffSelector },
-    { 'ss16',   kStylisticAlternativesType, kStylisticAltSixteenOnSelector,         kStylisticAltSixteenOffSelector },
-    { 'ss17',   kStylisticAlternativesType, kStylisticAltSeventeenOnSelector,       kStylisticAltSeventeenOffSelector },
-    { 'ss18',   kStylisticAlternativesType, kStylisticAltEighteenOnSelector,        kStylisticAltEighteenOffSelector },
-    { 'ss19',   kStylisticAlternativesType, kStylisticAltNineteenOnSelector,        kStylisticAltNineteenOffSelector },
-    { 'ss20',   kStylisticAlternativesType, kStylisticAltTwentyOnSelector,          kStylisticAltTwentyOffSelector },
-    { 'subs',   kVerticalPositionType,      kInferiorsSelector,                     kNormalPositionSelector },
-    { 'sups',   kVerticalPositionType,      kSuperiorsSelector,                     kNormalPositionSelector },
-    { 'swsh',   kContextualAlternatesType,  kSwashAlternatesOnSelector,             kSwashAlternatesOffSelector },
-    { 'titl',   kStyleOptionsType,          kTitlingCapsSelector,                   kNoStyleOptionsSelector },
-    { 'tnam',   kCharacterShapeType,        kTraditionalNamesCharactersSelector,    16 },
-    { 'tnum',   kNumberSpacingType,         kMonospacedNumbersSelector,             4 },
-    { 'trad',   kCharacterShapeType,        kTraditionalCharactersSelector,         16 },
-    { 'twid',   kTextSpacingType,           kThirdWidthTextSelector,                7 },
-    { 'unic',   kLetterCaseType,            14,                                     15 },
-    { 'valt',   kTextSpacingType,           kAltProportionalTextSelector,           7 },
-    { 'vert',   kVerticalSubstitutionType,  kSubstituteVerticalFormsOnSelector,     kSubstituteVerticalFormsOffSelector },
-    { 'vhal',   kTextSpacingType,           kAltHalfWidthTextSelector,              7 },
-    { 'vkna',   kAlternateKanaType,         kAlternateVertKanaOnSelector,           kAlternateVertKanaOffSelector },
-    { 'vpal',   kTextSpacingType,           kAltProportionalTextSelector,           7 },
-    { 'vrt2',   kVerticalSubstitutionType,  kSubstituteVerticalFormsOnSelector,     kSubstituteVerticalFormsOffSelector },
-    { 'zero',   kTypographicExtrasType,     kSlashedZeroOnSelector,                 kSlashedZeroOffSelector },
-};
-
-static int
-_hb_feature_mapping_cmp (const void *key_, const void *entry_)
-{
-  unsigned int key = * (unsigned int *) key_;
-  const feature_mapping_t * entry = (const feature_mapping_t *) entry_;
-  return key < entry->otFeatureTag ? -1 :
-	 key > entry->otFeatureTag ? 1 :
-	 0;
-}
-
 hb_bool_t
 _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
 		    hb_font_t          *font,
@@ -566,15 +455,15 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
                     unsigned int        num_features)
 {
   hb_face_t *face = font->face;
-  CGFontRef cg_font = (CGFontRef) HB_SHAPER_DATA_GET (face);
-  CTFontRef ct_font = (CTFontRef) HB_SHAPER_DATA_GET (font);
+  CGFontRef cg_font = (CGFontRef) (const void *) face->data.coretext;
+  CTFontRef ct_font = (CTFontRef) hb_coretext_font_data_sync (font);
 
   CGFloat ct_font_size = CTFontGetSize (ct_font);
   CGFloat x_mult = (CGFloat) font->x_scale / ct_font_size;
   CGFloat y_mult = (CGFloat) font->y_scale / ct_font_size;
 
   /* Attach marks to their bases, to match the 'ot' shaper.
-   * Adapted from hb-ot-shape:hb_form_clusters().
+   * Adapted from a very old version of hb-ot-shape:hb_form_clusters().
    * Note that this only makes us be closer to the 'ot' shaper,
    * but by no means the same.  For example, if there's
    * B1 M1 B2 M2, and B1-B2 form a ligature, M2's cluster will
@@ -590,8 +479,8 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
 	buffer->merge_clusters (i - 1, i + 1);
   }
 
-  hb_auto_array_t<feature_record_t> feature_records;
-  hb_auto_array_t<range_record_t> range_records;
+  hb_vector_t<feature_record_t> feature_records;
+  hb_vector_t<range_record_t> range_records;
 
   /*
    * Set up features.
@@ -600,14 +489,10 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
   if (num_features)
   {
     /* Sort features by start/end events. */
-    hb_auto_array_t<feature_event_t> feature_events;
+    hb_vector_t<feature_event_t> feature_events;
     for (unsigned int i = 0; i < num_features; i++)
     {
-      const feature_mapping_t * mapping = (const feature_mapping_t *) bsearch (&features[i].tag,
-									       feature_mappings,
-									       ARRAY_LENGTH (feature_mappings),
-									       sizeof (feature_mappings[0]),
-									       _hb_feature_mapping_cmp);
+      const hb_aat_feature_mapping_t * mapping = hb_aat_layout_find_feature_mapping (features[i].tag);
       if (!mapping)
         continue;
 
@@ -619,15 +504,11 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
       feature_event_t *event;
 
       event = feature_events.push ();
-      if (unlikely (!event))
-	goto fail_features;
       event->index = features[i].start;
       event->start = true;
       event->feature = feature;
 
       event = feature_events.push ();
-      if (unlikely (!event))
-	goto fail_features;
       event->index = features[i].end;
       event->start = false;
       event->feature = feature;
@@ -641,17 +522,15 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
       feature.order = num_features + 1;
 
       feature_event_t *event = feature_events.push ();
-      if (unlikely (!event))
-	goto fail_features;
       event->index = 0; /* This value does magic. */
       event->start = false;
       event->feature = feature;
     }
 
     /* Scan events and save features for each range. */
-    hb_auto_array_t<active_feature_t> active_features;
+    hb_vector_t<active_feature_t> active_features;
     unsigned int last_index = 0;
-    for (unsigned int i = 0; i < feature_events.len; i++)
+    for (unsigned int i = 0; i < feature_events.length; i++)
     {
       feature_event_t *event = &feature_events[i];
 
@@ -659,16 +538,14 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
       {
         /* Save a snapshot of active features and the range. */
 	range_record_t *range = range_records.push ();
-	if (unlikely (!range))
-	  goto fail_features;
 
-	if (active_features.len)
+	if (active_features.length)
 	{
 	  CFMutableArrayRef features_array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
 
 	  /* TODO sort and resolve conflicting features? */
 	  /* active_features.qsort (); */
-	  for (unsigned int j = 0; j < active_features.len; j++)
+	  for (unsigned int j = 0; j < active_features.length; j++)
 	  {
 	    CFStringRef keys[] = {
 	      kCTFontFeatureTypeIdentifierKey,
@@ -718,22 +595,15 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
 	last_index = event->index;
       }
 
-      if (event->start) {
-        active_feature_t *feature = active_features.push ();
-	if (unlikely (!feature))
-	  goto fail_features;
-	*feature = event->feature;
+      if (event->start)
+      {
+        active_features.push (event->feature);
       } else {
         active_feature_t *feature = active_features.find (&event->feature);
 	if (feature)
-	  active_features.remove (feature - active_features.array);
+	  active_features.remove (feature - active_features.arrayZ);
       }
     }
-  }
-  else
-  {
-  fail_features:
-    num_features = 0;
   }
 
   unsigned int scratch_size;
@@ -741,7 +611,7 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
 
 #define ALLOCATE_ARRAY(Type, name, len, on_no_room) \
   Type *name = (Type *) scratch; \
-  { \
+  do { \
     unsigned int _consumed = DIV_CEIL ((len) * sizeof (Type), sizeof (*scratch)); \
     if (unlikely (_consumed > scratch_size)) \
     { \
@@ -750,7 +620,7 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
     } \
     scratch += _consumed; \
     scratch_size -= _consumed; \
-  }
+  } while (0)
 
   ALLOCATE_ARRAY (UniChar, pchars, buffer->len * 2, /*nothing*/);
   unsigned int chars_len = 0;
@@ -782,13 +652,13 @@ _hb_coretext_shape (hb_shape_plan_t    *shape_plan,
     DEBUG_MSG (CORETEXT, nullptr, __VA_ARGS__); \
     ret = false; \
     goto fail; \
-  } HB_STMT_END;
+  } HB_STMT_END
 
   bool ret = true;
   CFStringRef string_ref = nullptr;
   CTLineRef line = nullptr;
 
-  if (0)
+  if (false)
   {
 resize_and_retry:
     DEBUG_MSG (CORETEXT, buffer, "Buffer resize");
@@ -844,7 +714,7 @@ resize_and_retry:
 /* What's the iOS equivalent of this check?
  * The symbols was introduced in iOS 7.0.
  * At any rate, our fallback is safe and works fine. */
-#if MAC_OS_X_VERSION_MIN_REQUIRED < 1090
+#if !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && MAC_OS_X_VERSION_MIN_REQUIRED < 1090
 #  define kCTLanguageAttributeName CFSTR ("NSLanguage")
 #endif
         CFStringRef lang = CFStringCreateWithCStringNoCopy (kCFAllocatorDefault,
@@ -852,7 +722,10 @@ resize_and_retry:
 							    kCFStringEncodingUTF8,
 							    kCFAllocatorNull);
 	if (unlikely (!lang))
+        {
+	  CFRelease (attr_string);
 	  FAIL ("CFStringCreateWithCStringNoCopy failed");
+        }
 	CFAttributedStringSetAttribute (attr_string, CFRangeMake (0, chars_len),
 					kCTLanguageAttributeName, lang);
 	CFRelease (lang);
@@ -860,7 +733,7 @@ resize_and_retry:
       CFAttributedStringSetAttribute (attr_string, CFRangeMake (0, chars_len),
 				      kCTFontAttributeName, ct_font);
 
-      if (num_features && range_records.len)
+      if (num_features && range_records.length)
       {
 	unsigned int start = 0;
 	range_record_t *last_range = &range_records[0];
@@ -901,7 +774,7 @@ resize_and_retry:
 	      feature.start < chars_len && feature.start < feature.end)
 	  {
 	    CFRange feature_range = CFRangeMake (feature.start,
-	                                         MIN (feature.end, chars_len) - feature.start);
+	                                         hb_min (feature.end, chars_len) - feature.start);
 	    if (feature.value)
 	      CFAttributedStringRemoveAttribute (attr_string, feature_range, kCTKernAttributeName);
 	    else
@@ -913,6 +786,9 @@ resize_and_retry:
 
       int level = HB_DIRECTION_IS_FORWARD (buffer->props.direction) ? 0 : 1;
       CFNumberRef level_number = CFNumberCreate (kCFAllocatorDefault, kCFNumberIntType, &level);
+#if !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) && MAC_OS_X_VERSION_MIN_REQUIRED < 1060
+      extern const CFStringRef kCTTypesetterOptionForcedEmbeddingLevel;
+#endif
       CFDictionaryRef options = CFDictionaryCreate (kCFAllocatorDefault,
 						    (const void **) &kCTTypesetterOptionForcedEmbeddingLevel,
 						    (const void **) &level_number,
@@ -921,7 +797,10 @@ resize_and_retry:
 						    &kCFTypeDictionaryValueCallBacks);
       CFRelease (level_number);
       if (unlikely (!options))
+      {
+        CFRelease (attr_string);
         FAIL ("CFDictionaryCreate failed");
+      }
 
       CTTypesetterRef typesetter = CTTypesetterCreateWithAttributedStringAndOptions (attr_string, options);
       CFRelease (options);
@@ -945,7 +824,7 @@ resize_and_retry:
     /* For right-to-left runs, CoreText returns the glyphs positioned such that
      * any trailing whitespace is to the left of (0,0).  Adjust coordinate system
      * to fix for that.  Test with any RTL string with trailing spaces.
-     * https://code.google.com/p/chromium/issues/detail?id=469028
+     * https://crbug.com/469028
      */
     if (HB_DIRECTION_IS_BACKWARD (buffer->props.direction))
     {
@@ -998,12 +877,12 @@ resize_and_retry:
 	 * However, even that wouldn't work if we were passed in the CGFont to
 	 * construct a hb_face to begin with.
 	 *
-	 * See: http://github.com/behdad/harfbuzz/pull/36
+	 * See: https://github.com/harfbuzz/harfbuzz/pull/36
 	 *
 	 * Also see: https://bugs.chromium.org/p/chromium/issues/detail?id=597098
 	 */
 	bool matched = false;
-	for (unsigned int i = 0; i < range_records.len; i++)
+	for (unsigned int i = 0; i < range_records.length; i++)
 	  if (range_records[i].font && CFEqual (run_ct_font, range_records[i].font))
 	  {
 	    matched = true;
@@ -1011,7 +890,7 @@ resize_and_retry:
 	  }
 	if (!matched)
 	{
-	  CGFontRef run_cg_font = CTFontCopyGraphicsFont (run_ct_font, 0);
+	  CGFontRef run_cg_font = CTFontCopyGraphicsFont (run_ct_font, nullptr);
 	  if (run_cg_font)
 	  {
 	    matched = CFEqual (run_cg_font, cg_font);
@@ -1101,7 +980,7 @@ resize_and_retry:
 
 #define SCRATCH_RESTORE() \
   scratch_size = scratch_size_saved; \
-  scratch = scratch_saved;
+  scratch = scratch_saved
 
       { /* Setup glyphs */
         SCRATCH_SAVE();
@@ -1184,16 +1063,16 @@ resize_and_retry:
     }
 
     /* Mac OS 10.6 doesn't have kCTTypesetterOptionForcedEmbeddingLevel,
-     * or if it does, it doesn't resepct it.  So we get runs with wrong
+     * or if it does, it doesn't respect it.  So we get runs with wrong
      * directions.  As such, disable the assert...  It wouldn't crash, but
      * cursoring will be off...
      *
-     * http://crbug.com/419769
+     * https://crbug.com/419769
      */
-    if (0)
+    if (false)
     {
       /* Make sure all runs had the expected direction. */
-      bool backward = HB_DIRECTION_IS_BACKWARD (buffer->props.direction);
+      HB_UNUSED bool backward = HB_DIRECTION_IS_BACKWARD (buffer->props.direction);
       assert (bool (status_and & kCTRunStatusRightToLeft) == backward);
       assert (bool (status_or  & kCTRunStatusRightToLeft) == backward);
     }
@@ -1210,8 +1089,6 @@ resize_and_retry:
 	pos->x_offset = info->var1.i32;
 	pos->y_offset = info->var2.i32;
 
-	info->mask = HB_GLYPH_FLAG_UNSAFE_TO_BREAK;
-
 	info++, pos++;
       }
     else
@@ -1220,8 +1097,6 @@ resize_and_retry:
 	pos->y_advance = info->mask;
 	pos->x_offset = info->var1.i32;
 	pos->y_offset = info->var2.i32;
-
-	info->mask = HB_GLYPH_FLAG_UNSAFE_TO_BREAK;
 
 	info++, pos++;
       }
@@ -1244,7 +1119,7 @@ resize_and_retry:
 	unsigned int cluster = info[count - 1].cluster;
 	for (unsigned int i = count - 1; i > 0; i--)
 	{
-	  cluster = MIN (cluster, info[i - 1].cluster);
+	  cluster = hb_min (cluster, info[i - 1].cluster);
 	  info[i - 1].cluster = cluster;
 	}
       }
@@ -1253,12 +1128,14 @@ resize_and_retry:
 	unsigned int cluster = info[0].cluster;
 	for (unsigned int i = 1; i < count; i++)
 	{
-	  cluster = MIN (cluster, info[i].cluster);
+	  cluster = hb_min (cluster, info[i].cluster);
 	  info[i].cluster = cluster;
 	}
       }
     }
   }
+
+  buffer->unsafe_to_break_all ();
 
 #undef FAIL
 
@@ -1268,7 +1145,7 @@ fail:
   if (line)
     CFRelease (line);
 
-  for (unsigned int i = 0; i < range_records.len; i++)
+  for (unsigned int i = 0; i < range_records.length; i++)
     if (range_records[i].font)
       CFRelease (range_records[i].font);
 
@@ -1276,94 +1153,4 @@ fail:
 }
 
 
-/*
- * AAT shaper
- */
-
-HB_SHAPER_DATA_ENSURE_DEFINE(coretext_aat, face)
-HB_SHAPER_DATA_ENSURE_DEFINE(coretext_aat, font)
-
-/*
- * shaper face data
- */
-
-struct hb_coretext_aat_shaper_face_data_t {};
-
-hb_coretext_aat_shaper_face_data_t *
-_hb_coretext_aat_shaper_face_data_create (hb_face_t *face)
-{
-  static const hb_tag_t tags[] = {HB_CORETEXT_TAG_MORX, HB_CORETEXT_TAG_MORT, HB_CORETEXT_TAG_KERX};
-
-  for (unsigned int i = 0; i < ARRAY_LENGTH (tags); i++)
-  {
-    hb_blob_t *blob = face->reference_table (tags[i]);
-    if (hb_blob_get_length (blob))
-    {
-      hb_blob_destroy (blob);
-      return hb_coretext_shaper_face_data_ensure (face) ? (hb_coretext_aat_shaper_face_data_t *) HB_SHAPER_DATA_SUCCEEDED : nullptr;
-    }
-    hb_blob_destroy (blob);
-  }
-
-  return nullptr;
-}
-
-void
-_hb_coretext_aat_shaper_face_data_destroy (hb_coretext_aat_shaper_face_data_t *data HB_UNUSED)
-{
-}
-
-
-/*
- * shaper font data
- */
-
-struct hb_coretext_aat_shaper_font_data_t {};
-
-hb_coretext_aat_shaper_font_data_t *
-_hb_coretext_aat_shaper_font_data_create (hb_font_t *font)
-{
-  return hb_coretext_shaper_font_data_ensure (font) ? (hb_coretext_aat_shaper_font_data_t *) HB_SHAPER_DATA_SUCCEEDED : nullptr;
-}
-
-void
-_hb_coretext_aat_shaper_font_data_destroy (hb_coretext_aat_shaper_font_data_t *data HB_UNUSED)
-{
-}
-
-
-/*
- * shaper shape_plan data
- */
-
-struct hb_coretext_aat_shaper_shape_plan_data_t {};
-
-hb_coretext_aat_shaper_shape_plan_data_t *
-_hb_coretext_aat_shaper_shape_plan_data_create (hb_shape_plan_t    *shape_plan HB_UNUSED,
-					     const hb_feature_t *user_features HB_UNUSED,
-					     unsigned int        num_user_features HB_UNUSED,
-					     const int          *coords HB_UNUSED,
-					     unsigned int        num_coords HB_UNUSED)
-{
-  return (hb_coretext_aat_shaper_shape_plan_data_t *) HB_SHAPER_DATA_SUCCEEDED;
-}
-
-void
-_hb_coretext_aat_shaper_shape_plan_data_destroy (hb_coretext_aat_shaper_shape_plan_data_t *data HB_UNUSED)
-{
-}
-
-
-/*
- * shaper
- */
-
-hb_bool_t
-_hb_coretext_aat_shape (hb_shape_plan_t    *shape_plan,
-			hb_font_t          *font,
-			hb_buffer_t        *buffer,
-			const hb_feature_t *features,
-			unsigned int        num_features)
-{
-  return _hb_coretext_shape (shape_plan, font, buffer, features, num_features);
-}
+#endif
