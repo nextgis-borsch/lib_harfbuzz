@@ -1,7 +1,8 @@
-docs,docs,skip,""
-m4,m4,skip,""
+docs,docs,skip,
+m4,m4,skip,
+perf,perf,skip,
+subprojects,subprojects,skip,
 src,src,,"hh,cc,h,c,Makefile.sources"
-src/hb-ucdn,src/hb-ucdn,,"hh,cc,h,c,Makefile.sources"
-test,test,skip,""
+test,test,skip,
 util,util,,"hh,cc,h,c,Makefile.sources"
 ,,,"ac,THANKS,RELEASING.md,README.python,README,NEWS,COPYING,ChangeLog,AUTHORS"

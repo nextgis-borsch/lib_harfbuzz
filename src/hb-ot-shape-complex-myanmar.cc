@@ -29,6 +29,7 @@
 #ifndef HB_NO_OT_SHAPE
 
 #include "hb-ot-shape-complex-myanmar.hh"
+#include "hb-ot-shape-complex-myanmar-machine.hh"
 
 
 /*
@@ -58,25 +59,6 @@ myanmar_other_features[] =
   HB_TAG('a','b','v','s'),
   HB_TAG('b','l','w','s'),
   HB_TAG('p','s','t','s'),
-};
-static const hb_tag_t
-myanmar_positioning_features[] =
-{
-  /*
-   * Positioning features.
-   * We don't care about the types.
-   */
-  HB_TAG('d','i','s','t'),
-  /* Pre-release version of Windows 8 Myanmar font had abvm,blwm
-   * features.  The released Windows 8 version of the font (as well
-   * as the released spec) used 'mark' instead.  The Windows 8
-   * shaper however didn't apply 'mark' but did apply 'mkmk'.
-   * Perhaps it applied abvm/blwm.  This was fixed in a Windows 8
-   * update, so now it applies mark/mkmk.  We are guessing that
-   * it still applies abvm/blwm too.
-   */
-  HB_TAG('a','b','v','m'),
-  HB_TAG('b','l','w','m'),
 };
 
 static void
@@ -114,32 +96,12 @@ collect_features_myanmar (hb_ot_shape_planner_t *plan)
 
   for (unsigned int i = 0; i < ARRAY_LENGTH (myanmar_other_features); i++)
     map->enable_feature (myanmar_other_features[i], F_MANUAL_ZWJ);
-
-  for (unsigned int i = 0; i < ARRAY_LENGTH (myanmar_positioning_features); i++)
-    map->enable_feature (myanmar_positioning_features[i]);
 }
-
-static void
-override_features_myanmar (hb_ot_shape_planner_t *plan)
-{
-  plan->map.disable_feature (HB_TAG('l','i','g','a'));
-}
-
-
-enum myanmar_syllable_type_t {
-  myanmar_consonant_syllable,
-  myanmar_punctuation_cluster,
-  myanmar_broken_cluster,
-  myanmar_non_myanmar_cluster,
-};
-
-#include "hb-ot-shape-complex-myanmar-machine.hh"
-
 
 static void
 setup_masks_myanmar (const hb_ot_shape_plan_t *plan HB_UNUSED,
-		   hb_buffer_t              *buffer,
-		   hb_font_t                *font HB_UNUSED)
+		     hb_buffer_t              *buffer,
+		     hb_font_t                *font HB_UNUSED)
 {
   HB_BUFFER_ALLOCATE_VAR (buffer, myanmar_category);
   HB_BUFFER_ALLOCATE_VAR (buffer, myanmar_position);
@@ -261,7 +223,7 @@ initial_reordering_consonant_syllable (hb_buffer_t *buffer,
       }
       if (pos == POS_BELOW_C && info[i].myanmar_category() != OT_A)
       {
-        pos = POS_AFTER_SUB;
+	pos = POS_AFTER_SUB;
 	info[i].myanmar_position() = pos;
 	continue;
       }
@@ -293,72 +255,21 @@ reorder_syllable_myanmar (const hb_ot_shape_plan_t *plan HB_UNUSED,
   }
 }
 
-static inline void
-insert_dotted_circles_myanmar (const hb_ot_shape_plan_t *plan HB_UNUSED,
-			       hb_font_t *font,
-			       hb_buffer_t *buffer)
-{
-  if (unlikely (buffer->flags & HB_BUFFER_FLAG_DO_NOT_INSERT_DOTTED_CIRCLE))
-    return;
-
-  /* Note: This loop is extra overhead, but should not be measurable.
-   * TODO Use a buffer scratch flag to remove the loop. */
-  bool has_broken_syllables = false;
-  unsigned int count = buffer->len;
-  hb_glyph_info_t *info = buffer->info;
-  for (unsigned int i = 0; i < count; i++)
-    if ((info[i].syllable() & 0x0F) == myanmar_broken_cluster)
-    {
-      has_broken_syllables = true;
-      break;
-    }
-  if (likely (!has_broken_syllables))
-    return;
-
-
-  hb_codepoint_t dottedcircle_glyph;
-  if (!font->get_nominal_glyph (0x25CCu, &dottedcircle_glyph))
-    return;
-
-  hb_glyph_info_t dottedcircle = {0};
-  dottedcircle.codepoint = 0x25CCu;
-  set_myanmar_properties (dottedcircle);
-  dottedcircle.codepoint = dottedcircle_glyph;
-
-  buffer->clear_output ();
-
-  buffer->idx = 0;
-  unsigned int last_syllable = 0;
-  while (buffer->idx < buffer->len && buffer->successful)
-  {
-    unsigned int syllable = buffer->cur().syllable();
-    myanmar_syllable_type_t syllable_type = (myanmar_syllable_type_t) (syllable & 0x0F);
-    if (unlikely (last_syllable != syllable && syllable_type == myanmar_broken_cluster))
-    {
-      last_syllable = syllable;
-
-      hb_glyph_info_t ginfo = dottedcircle;
-      ginfo.cluster = buffer->cur().cluster;
-      ginfo.mask = buffer->cur().mask;
-      ginfo.syllable() = buffer->cur().syllable();
-
-      buffer->output_info (ginfo);
-    }
-    else
-      buffer->next_glyph ();
-  }
-  buffer->swap_buffers ();
-}
-
 static void
 reorder_myanmar (const hb_ot_shape_plan_t *plan,
 		 hb_font_t *font,
 		 hb_buffer_t *buffer)
 {
-  insert_dotted_circles_myanmar (plan, font, buffer);
+  if (buffer->message (font, "start reordering myanmar"))
+  {
+    hb_syllabic_insert_dotted_circles (font, buffer,
+				       myanmar_broken_cluster,
+				       OT_GB);
 
-  foreach_syllable (buffer, start, end)
-    reorder_syllable_myanmar (plan, font->face, buffer, start, end);
+    foreach_syllable (buffer, start, end)
+      reorder_syllable_myanmar (plan, font->face, buffer, start, end);
+    (void) buffer->message (font, "end reordering myanmar");
+  }
 
   HB_BUFFER_DEALLOCATE_VAR (buffer, myanmar_category);
   HB_BUFFER_DEALLOCATE_VAR (buffer, myanmar_position);
@@ -368,7 +279,7 @@ reorder_myanmar (const hb_ot_shape_plan_t *plan,
 const hb_ot_complex_shaper_t _hb_ot_complex_shaper_myanmar =
 {
   collect_features_myanmar,
-  override_features_myanmar,
+  nullptr, /* override_features */
   nullptr, /* data_create */
   nullptr, /* data_destroy */
   nullptr, /* preprocess_text */

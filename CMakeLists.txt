@@ -48,8 +48,6 @@ if(CMAKE_GENERATOR_TOOLSET MATCHES "v([0-9]+)_xp")
     add_definitions(-D_WIN32_WINNT=0x0501)
 endif()
 
-# enable_testing()
-
 ## Limit framework build to Xcode generator
 # if (BUILD_FRAMEWORK)
 #   # for a framework on macOS, use `cmake .. -DBUILD_FRAMEWORK:BOOL=true -G Xcode`
@@ -99,7 +97,6 @@ if (HB_BUILD_UTILS)
 endif ()
 
 option(HB_BUILD_SUBSET "Build harfbuzz-subset" ON)
-option(HB_BUILD_TESTS "Build harfbuzz tests" ON)
 
 option(HB_HAVE_GOBJECT "Enable GObject Bindings" OFF)
 if (HB_HAVE_GOBJECT)
@@ -110,25 +107,6 @@ option(HB_HAVE_INTROSPECTION "Enable building introspection (.gir/.typelib) file
 if (HB_HAVE_INTROSPECTION)
   set (HB_HAVE_GOBJECT ON)
   set (HB_HAVE_GLIB ON)
-endif ()
-
-option(HB_CHECK OFF "Do a configuration suitable for testing (shared library and enable all options)")
-if (HB_CHECK)
-  set (BUILD_SHARED_LIBS ON)
-  set (HB_BUILD_UTILS ON)
-  set (HB_HAVE_ICU)
-  set (HB_HAVE_GLIB ON)
-  #set (HB_HAVE_GOBJECT ON)
-  #set (HB_HAVE_INTROSPECTION ON)
-  set (HB_HAVE_FREETYPE ON)
-  set (HB_HAVE_GRAPHITE2 ON)
-  if (WIN32)
-    set (HB_HAVE_UNISCRIBE ON)
-    set (HB_HAVE_GDI ON)
-    set (HB_HAVE_DIRECTWRITE ON)
-  elseif (APPLE)
-    set (HB_HAVE_CORETEXT ON)
-  endif ()
 endif ()
 
 include_directories(AFTER
@@ -154,7 +132,7 @@ endmacro ()
 if (UNIX)
   list(APPEND CMAKE_REQUIRED_LIBRARIES m)
 endif ()
-check_funcs(atexit mprotect sysconf getpagesize mmap isatty newlocale strtod_l)
+check_funcs(atexit mprotect sysconf getpagesize mmap isatty)
 check_include_file(unistd.h HAVE_UNISTD_H)
 if (${HAVE_UNISTD_H})
   add_definitions(-DHAVE_UNISTD_H)
@@ -163,15 +141,15 @@ check_include_file(sys/mman.h HAVE_SYS_MMAN_H)
 if (${HAVE_SYS_MMAN_H})
   add_definitions(-DHAVE_SYS_MMAN_H)
 endif ()
-check_include_file(xlocale.h HAVE_XLOCALE_H)
-if (${HAVE_XLOCALE_H})
-  add_definitions(-DHAVE_XLOCALE_H)
-endif ()
 check_include_file(stdbool.h HAVE_STDBOOL_H)
 if (${HAVE_STDBOOL_H})
   add_definitions(-DHAVE_STDBOOL_H)
 endif ()
 
+# https://github.com/harfbuzz/harfbuzz/pull/2874#issuecomment-782859099
+if (NOT WIN32)
+  add_definitions("-DHAVE_PTHREAD")
+endif ()
 
 if (MSVC)
   add_definitions(-wd4244 -wd4267 -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_WARNINGS)
@@ -193,7 +171,7 @@ function (extract_make_variable variable makefile_source)
   set (${variable} ${listVar} PARENT_SCOPE)
 endfunction ()
 
-# http://stackoverflow.com/a/27630120
+# https://stackoverflow.com/a/27630120
 function (add_prefix_to_list var prefix)
   set (listVar "")
   foreach (f ${${var}})
@@ -299,7 +277,7 @@ endif ()
 if (HB_HAVE_GLIB)
   add_definitions(-DHAVE_GLIB)
 
-  # https://github.com/WebKit/webkit/blob/master/Source/cmake/FindGLIB.cmake
+  # https://github.com/WebKit/webkit/blob/fdd7733f2f30eab7fe096a9791f98c60f62f49c0/Source/cmake/FindICU.cmake
   find_package(PkgConfig)
   pkg_check_modules(PC_GLIB QUIET glib-2.0)
 
@@ -388,6 +366,7 @@ if (WIN32 AND HB_HAVE_DIRECTWRITE)
 endif ()
 
 if (HB_HAVE_GOBJECT)
+  add_definitions(-DHAVE_GOBJECT)
   include (FindPerl)
 
   # Use the hints from glib-2.0.pc to find glib-mkenums
@@ -491,37 +470,6 @@ if (HB_HAVE_GOBJECT)
   )
 endif ()
 
-## Atomic ops availability detection
-file(WRITE "${PROJECT_BINARY_DIR}/try_compile_intel_atomic_primitives.c"
-"		void memory_barrier (void) { __sync_synchronize (); }
-		int atomic_add (int *i) { return __sync_fetch_and_add (i, 1); }
-		int mutex_trylock (int *m) { return __sync_lock_test_and_set (m, 1); }
-		void mutex_unlock (int *m) { __sync_lock_release (m); }
-		int main () { return 0; }
-")
-try_compile(HB_HAVE_INTEL_ATOMIC_PRIMITIVES
-  ${PROJECT_BINARY_DIR}/try_compile_intel_atomic_primitives
-  ${PROJECT_BINARY_DIR}/try_compile_intel_atomic_primitives.c)
-if (HB_HAVE_INTEL_ATOMIC_PRIMITIVES)
-  add_definitions(-DHAVE_INTEL_ATOMIC_PRIMITIVES)
-endif ()
-
-file(WRITE "${PROJECT_BINARY_DIR}/try_compile_solaris_atomic_ops.c"
-"		#include <atomic.h>
-		/* This requires Solaris Studio 12.2 or newer: */
-		#include <mbarrier.h>
-		void memory_barrier (void) { __machine_rw_barrier (); }
-		int atomic_add (volatile unsigned *i) { return atomic_add_int_nv (i, 1); }
-		void *atomic_ptr_cmpxchg (volatile void **target, void *cmp, void *newval) { return atomic_cas_ptr (target, cmp, newval); }
-		int main () { return 0; }
-")
-try_compile(HB_HAVE_SOLARIS_ATOMIC_OPS
-  ${PROJECT_BINARY_DIR}/try_compile_solaris_atomic_ops
-  ${PROJECT_BINARY_DIR}/try_compile_solaris_atomic_ops.c)
-if (HB_HAVE_SOLARIS_ATOMIC_OPS)
-  add_definitions(-DHAVE_SOLARIS_ATOMIC_OPS)
-endif ()
-
 set(INSTALL_TARGETS harfbuzz)
 
 ## Define harfbuzz library
@@ -532,6 +480,23 @@ else()
 endif()
 
 target_link_libraries(harfbuzz ${THIRD_PARTY_LIBS})
+
+target_include_directories(harfbuzz PUBLIC
+                           "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
+                           "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/harfbuzz>")
+
+## Define harfbuzz-icu library
+if (HB_HAVE_ICU)
+  add_library(harfbuzz-icu ${PROJECT_SOURCE_DIR}/src/hb-icu.cc ${PROJECT_SOURCE_DIR}/src/hb-icu.h)
+  add_dependencies(harfbuzz-icu harfbuzz)
+  target_link_libraries(harfbuzz-icu harfbuzz ${THIRD_PARTY_LIBS})
+
+  if (BUILD_SHARED_LIBS)
+    set_target_properties(harfbuzz harfbuzz-icu PROPERTIES VISIBILITY_INLINES_HIDDEN TRUE)
+  endif ()
+
+  set(INSTALL_TARGETS ${INSTALL_TARGETS} harfbuzz-icu)
+endif ()
 
 
 ## Define harfbuzz-subset library
@@ -685,12 +650,14 @@ if (HB_HAVE_INTROSPECTION)
     POST_BUILD
     COMMAND ${G_IR_SCANNER_CMD}
       --warn-all --no-libtool --verbose
-      -n hb
       --namespace=HarfBuzz
       --nsversion=0.0
+      --symbol-prefix=hb
+      --symbol-prefix=hb_gobject
       --identifier-prefix=hb_
       --include GObject-2.0
-      --pkg-export=harfbuzz
+      --pkg-export=harfbuzz-gobject
+      --c-include=hb-gobject.h
       --cflags-begin
       -I${PROJECT_SOURCE_DIR}/src
       -I${PROJECT_BINARY_DIR}/src
@@ -714,6 +681,7 @@ if (HB_HAVE_INTROSPECTION)
       -o ${hb_libpath}/HarfBuzz-0.0.gir
     DEPENDS harfbuzz-gobject harfbuzz ${CMAKE_CURRENT_BINARY_DIR}/src/hb_gir_list
   )
+
 
   add_custom_command(
     TARGET harfbuzz-gobject
@@ -783,51 +751,6 @@ if (NOT SKIP_INSTALL_HEADERS AND NOT SKIP_INSTALL_ALL)
 endif ()
 
 if (NOT SKIP_INSTALL_LIBRARIES AND NOT SKIP_INSTALL_ALL)
-  # install(TARGETS harfbuzz
-  #   ARCHIVE DESTINATION lib
-  #   LIBRARY DESTINATION lib
-  #   RUNTIME DESTINATION bin
-  #   FRAMEWORK DESTINATION Library/Frameworks
-  #   )
-  # if (HB_BUILD_UTILS)
-  #   install(TARGETS hb-view
-  #     RUNTIME DESTINATION bin
-  #   )
-  #   install(TARGETS hb-view
-  #     RUNTIME DESTINATION bin
-  #   )
-  #
-  #   install(TARGETS hb-shape
-  #     RUNTIME DESTINATION bin
-  #   )
-  #
-  #   install(TARGETS hb-ot-shape-closure
-  #     RUNTIME DESTINATION bin
-  #   )
-  # endif ()
-  # if (HB_HAVE_GOBJECT)
-  #   install(TARGETS harfbuzz-gobject
-  #     ARCHIVE DESTINATION lib
-  #     LIBRARY DESTINATION lib
-  #     RUNTIME DESTINATION bin
-  #   )
-  #   if (HB_HAVE_INTROSPECTION)
-  #     if("${CMAKE_GENERATOR}" MATCHES "Visual Studio*")
-  #       set (hb_libpath "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIGURATION>")
-  #     else ()
-  #       set (hb_libpath "$<TARGET_FILE_DIR:harfbuzz-gobject>")
-  #     endif ()
-  #
-  #     install(FILES "${hb_libpath}/HarfBuzz-0.0.gir"
-  #       DESTINATION share/gir-1.0
-  #       )
-  #
-  #     install(FILES "${hb_libpath}/HarfBuzz-0.0.typelib"
-  #       DESTINATION lib/girepository-1.0
-  #       )
-  #   endif ()
-  # endif ()
-
   install(TARGETS ${INSTALL_TARGETS}
         EXPORT ${PACKAGE_UPPER_NAME}Targets
         RUNTIME DESTINATION ${INSTALL_BIN_DIR}
