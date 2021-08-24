@@ -482,8 +482,7 @@ endif()
 target_link_libraries(harfbuzz ${THIRD_PARTY_LIBS})
 
 target_include_directories(harfbuzz PUBLIC
-                           "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
-                           "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/harfbuzz>")
+                           "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>")
 
 ## Define harfbuzz-icu library
 if (HB_HAVE_ICU)
